@@ -6,6 +6,7 @@ from typing import List, Dict, Optional, Tuple, Iterable
 from dataclasses import dataclass
 from fractions import Fraction
 from operator import itemgetter
+import argparse
 
 Candidate = str
 Allocation = Dict[Candidate, List['Ballot']]
@@ -42,15 +43,15 @@ class Ballot:
         return (bool(self.choices)
                 and len(self.choices) == len(set(self.choices)))
 
-    def transfer(self, remaining: Iterable[Candidate]) -> Optional[Candidate]:
+    def transfer(self, allocation: Allocation) -> None:
         """Transfer ballot to next remaining candidate."""
         try:
-            while self.choices[0] not in remaining:
+            while self.choices[0] not in allocation:
                 self.choices.pop(0)
-        except IndexError:
-            return None
 
-        return self.choices[0]
+            allocation[self.choices[0]].append(self)
+        except IndexError:
+            pass
 
     @staticmethod
     def calc_score(ballots: List['Ballot']) -> Fraction:
@@ -80,7 +81,7 @@ class TieError(Exception):
 
 
 def calculate(seats: int, candidates: List[Candidate],
-          ballots: List[Ballot]) -> List[Candidate]:
+              ballots: List[Ballot]) -> List[Candidate]:
     """Calculate an STV election."""
     elected: List[Candidate] = []
     valid_ballots = [b for b in ballots if b.is_valid()]
@@ -127,9 +128,7 @@ def calculate(seats: int, candidates: List[Candidate],
                 multiplier = Fraction(surplus, quota)
                 for ballot in allocation.pop(candidate):
                     ballot.value *= multiplier
-                    recipient = ballot.transfer(allocation.keys())
-                    if recipient is not None:
-                        allocation[recipient].append(ballot)
+                    ballot.transfer(allocation)
         else:
             min_score = min(scores.values())
             lowest_scoring = [c for c, s in scores.items() if s == min_score]
@@ -139,9 +138,7 @@ def calculate(seats: int, candidates: List[Candidate],
             eliminated = lowest_scoring[0]
             print(f'Eliminating {eliminated}')
             for ballot in allocation.pop(eliminated):
-                recipient = ballot.transfer(allocation.keys())
-                if recipient is not None:
-                    allocation[recipient].append(ballot)
+                ballot.transfer(allocation)
 
         round += 1
 
@@ -150,11 +147,30 @@ def calculate(seats: int, candidates: List[Candidate],
 
 if __name__ == '__main__':
     from csv import reader
-    from sys import stdin
+    import sys
 
-    csv_reader = reader(stdin)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('seats',
+                        type=int,
+                        default=1,
+                        help='number of seats in election')
+    parser.add_argument('file',
+                        nargs='?',
+                        type=argparse.FileType('r'),
+                        default=sys.stdin,
+                        help='CSV file containing ballots. (default: stdin)')
+    args = parser.parse_args()
+
+    if args.seats < 1:
+        print('error: must have at least 1 seat', file=sys.stderr)
+        sys.exit(1)
+
+    csv_reader = reader(args.file)
     candidates = next(csv_reader)
     ballots = [Ballot.from_row(row, candidates) for row in csv_reader]
 
-    elected = calculate(3, candidates, ballots)
-    print('\nElected:', ', '.join(elected))
+    try:
+        elected = calculate(args.seats, candidates, ballots)
+        print('\nElected:', ', '.join(elected))
+    except TieError as e:
+        print(e)
