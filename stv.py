@@ -100,16 +100,19 @@ def calculate(seats: int, candidates: List[Candidate],
     while len(elected) < seats:
         print(f'\n=== Round {round}')
 
-        if len(allocation) <= seats - len(elected):
-            for candidate in allocation.keys():
-                elected.append(candidate)
-                print(f'Elected {candidate} by default')
-            break
-
         scores = {c: Ballot.calc_score(bs) for c, bs in allocation.items()}
         print('Scores (to 5 d.p.):')
         for candidate, score in scores.items():
             print(f'  - {candidate}: {float(score):.5f}')
+
+        if len(allocation) <= seats - len(elected):
+            for candidate in allocation.keys():
+                elected.append(candidate)
+                if scores[candidate] >= quota:
+                    print(f'Elected {candidate}')
+                else:
+                    print(f'Elected {candidate} by default')
+            break
 
         reached_quota = [c for c, s in scores.items() if s >= quota]
         if reached_quota:
