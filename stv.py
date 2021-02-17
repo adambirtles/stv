@@ -1,247 +1,159 @@
-#!/usr/bin/env python3
-"""STV election calculator."""
-
-from typing import List, Dict, Optional, Any, Iterable
+from __future__ import annotations
+from typing import Dict, List, Tuple, Optional
 
 from dataclasses import dataclass
 from fractions import Fraction
-from operator import itemgetter
-import random
 import enum
-import argparse
 
-Candidate = str
-Allocation = Dict[Candidate, List['Ballot']]
+@dataclass
+class Candidate:
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+Electee = Tuple[Candidate, Fraction]
+
+class CountingBallot:
+    def __init__(self, choices: List[Candidate]):
+        if not choices or len(choices) != len(set(choices)):
+            raise ValueError('empty or spoiled ballot')
+
+        self.choices = choices
+        self.value = Fraction(1)
+
+    @classmethod
+    def valid_ballot(cls, choices: List[Candidate]) -> Optional[CountingBallot]:
+        try:
+            return cls(choices)
+        except ValueError:
+            return None
 
 
-def _list_str(l: Iterable[Any]) -> str:
-    return ', '.join(map(str, l))
+class RoundAction(enum.Enum):
+    ELECTED = enum.auto()
+    ELECTED_BY_DEFAULT = enum.auto()
+    ELIMINATED = enum.auto()
 
 
 @dataclass
-class Ballot:
-    """A ballot."""
-
-    choices: List[Candidate]
-    value: Fraction = Fraction(1)
-
-    @classmethod
-    def from_row(cls, row: List[str], candidates: List[Candidate]) -> 'Ballot':
-        """Create a Ballot from a CSV row."""
-        choices: Dict[int, Candidate] = {}
-        for n, c in zip(row, candidates):
-            if not n:
-                continue
-
-            k = int(n)
-            if k in choices:
-                return cls([])
-            choices[k] = c
-
-        return cls([c for _, c in sorted(choices.items(), key=itemgetter(0))])
-
-    def is_valid(self) -> bool:
-        """Check if ballot is valid.
-
-        A ballot is valid iff it is not empty and there are no duplicate
-        preferences.
-        """
-        return (bool(self.choices)
-                and len(self.choices) == len(set(self.choices)))
-
-    def transfer(self, allocation: Allocation) -> None:
-        """Transfer ballot to next remaining candidate."""
-        try:
-            while self.choices[0] not in allocation.keys():
-                self.choices.pop(0)
-
-            allocation[self.choices[0]].append(self)
-        except IndexError:
-            pass
-
-    @staticmethod
-    def calc_score(ballots: List['Ballot']) -> Fraction:
-        """Add up the values of ballots."""
-        return sum((b.value for b in ballots), Fraction(0))
+class Round:
+    number: int
+    scores: Dict[Candidate, Fraction]
+    action: RoundAction
+    affected: List[Candidate]
 
 
-class STVError(Exception):
-    """Base class for Exceptions raised when counting STV."""
-    def __init__(self, elected: List[Candidate]):
-        """Initialise STVError."""
-        self.elected = elected
+@dataclass
+class Result:
+    valid_ballots: int
+    spoiled_ballots: int
+    quota: int
+    elected: List[Electee]
+    rounds: List[Round]
 
 
-class UnbreakableTieError(STVError):
-    """Raised when there is a tie in an election."""
-    def __init__(self, elected: List[Candidate], tied: List[Candidate],
-                 electing: bool):
-        """Initialise UnbreakableTieError."""
-        super().__init__(elected)
+class Allocation:
+    def __init__(self, candidates: List[Candidate], ballots: List[CountingBallot]):
+        self._alloc: Dict[Candidate, List[CountingBallot]] = {c: [] for c in candidates}
+        for ballot in ballots:
+            self._alloc[ballot.choices[0]].append(ballot)
 
-        self.tied = tied
-        self.electing = electing
+    @property
+    def scores(self) -> Dict[Candidate, Fraction]:
+        return {c: sum((b.value for b in bs), Fraction(0)) for c, bs in self._alloc.items()}
 
-    def __str__(self) -> str:
-        candidate_list = _list_str(self.tied)
-        if self.electing:
-            return f'tie when electing: {candidate_list}'
-        else:
-            return f'tie when eliminating: {candidate_list}'
+    @property
+    def remaining_candidates(self) -> int:
+        return len(self._alloc)
 
+    def elect_candidate(self, candidate: Candidate, score: Fraction, quota: int) -> None:
+        surplus = score - quota
 
-class UnfilledSeatsError(STVError):
-    """Raised when seats are left unfilled."""
-    def __init__(self, elected: List[Candidate], unfilled: int, reason: str):
-        """Initialise UnfilledSeatsError."""
-        super().__init__(elected)
+        if surplus == 0:
+            del self._alloc[candidate]
+            return
 
-        self.unfilled = unfilled
-        self.reason = reason
+        multiplier = Fraction(surplus, quota)
+        for ballot in self._alloc[candidate]:
+            ballot.value *= multiplier
 
-    def __str__(self) -> str:
-        return self.reason
+        self.remove_candidate(candidate)
 
+    def remove_candidate(self, candidate: Candidate) -> None:
+        for ballot in self._alloc.pop(candidate):
+            try:
+                while ballot.choices[0] not in self._alloc.keys():
+                    ballot.choices.pop(0)
 
-class TieStrategy(enum.Enum):
-    """Represents strategies for breaking ties."""
-    NONE = enum.auto()
-    RANDOM = enum.auto()
-    FIRST_IN_ORDER = enum.auto()
-
-    def break_tie(self, tied: List[Candidate]) -> Optional[Candidate]:
-        """Break tie according to strategy."""
-        print('Tie between:', _list_str(tied))
-        print('Breaking tie with strategy:', self)
-        if self == TieStrategy.RANDOM:
-            return random.choice(tied)
-        elif self == TieStrategy.FIRST_IN_ORDER:
-            return sorted(tied)[0]
-        else:
-            return None
-
-    def __str__(self) -> str:
-        return self.name.replace('_', ' ').lower()
+                self._alloc[ballot.choices[0]].append(ballot)
+            except IndexError:
+                pass
 
 
-def calculate(seats: int,
-              candidates: List[Candidate],
-              ballots: List[Ballot],
-              no_defaulting: bool = False,
-              tie_strategy: TieStrategy = TieStrategy.NONE) -> List[Candidate]:
-    """Calculate an STV election."""
-    elected: List[Candidate] = []
-    valid_ballots = [b for b in ballots if b.is_valid()]
-    quota = (len(valid_ballots) // (seats + 1)) + 1
+class Election:
+    def __init__(self, seats: int, candidates: List[Candidate], ballots: List[List[Candidate]]):
+        self.seats = seats
+        self.candidates = candidates
 
-    print('Valid ballots:', len(valid_ballots))
-    print('Spoiled ballots:', len(ballots) - len(valid_ballots))
-    print('Quota:', quota)
+        self.valid_ballots = list(filter(None, map(CountingBallot.valid_ballot, ballots)))
+        self.spoiled_ballot_count = len(ballots) - len(self.valid_ballots)
 
-    allocation: Allocation = {c: [] for c in candidates}
-    for ballot in valid_ballots:
-        allocation[ballot.choices[0]].append(ballot)
+        self.elected: List[Electee] = []
+        self.rounds: List[Round] = []
+        self.allocation = Allocation(candidates, self.valid_ballots)
 
-    round = 1
+        self.allow_defaulting = False
 
-    while len(elected) < seats:
-        to_elect = seats - len(elected)
-        if len(allocation) == 0:
-            raise UnfilledSeatsError(
-                elected, seats - len(elected),
-                'not enough candidates to fill all seats')
+        self.quota = (len(self.valid_ballots) // (seats + 1)) + 1
 
-        print('\n=== Round', round)
+    def _do_round(self) -> None:
+        open_seats = self.seats - len(self.elected)
 
-        scores = {c: Ballot.calc_score(bs) for c, bs in allocation.items()}
-        print('Scores (to 5 d.p.):')
-        for candidate, score in scores.items():
-            print(f'  - {candidate}: {float(score):.5f}')
-
-        reached_quota = [c for c, s in scores.items() if s >= quota]
+        scores = self.allocation.scores
+        reached_quota = {c: s for c, s in scores.items() if s >= self.quota}
         if reached_quota:
-            if len(reached_quota) > to_elect:
-                tie_break_winner = tie_strategy.break_tie(reached_quota)
-                if tie_break_winner is None:
-                    raise UnbreakableTieError(elected, reached_quota, True)
-                reached_quota = [tie_break_winner]
+            # at least one candidate reached quota
+            if len(reached_quota) > open_seats:
+                raise Exception('tie between candidates to be elected')
 
-            for candidate in reached_quota:
-                elected.append(candidate)
-                print('Elected', candidate)
+            action = RoundAction.ELECTED
+            affected = list(reached_quota.keys())
 
-                surplus = scores[candidate] - quota
-                if surplus == 0:
-                    del allocation[candidate]
-                    continue
+            self.elected.extend(reached_quota.items())
+            for candidate, score in reached_quota.items():
+                self.allocation.elect_candidate(candidate, score, self.quota)
+        elif self.allocation.remaining_candidates <= open_seats:
+            # no one reached quota but candidates can win by default
+            if not self.allow_defaulting:
+                raise Exception('not enough candidates could reach quota to fill all seats')
 
-                multiplier = Fraction(surplus, quota)
-                for ballot in allocation.pop(candidate):
-                    ballot.value *= multiplier
-                    ballot.transfer(allocation)
-        elif len(allocation) <= to_elect:
-            if no_defaulting:
-                raise UnfilledSeatsError(
-                    elected, to_elect,
-                    'not enough candidates could reach quota to fill all seats.'
-                )
-
-            for candidate in allocation.keys():
-                elected.append(candidate)
-                print('Elected', candidate, 'by default')
+            action = RoundAction.ELECTED_BY_DEFAULT
+            affected = list(scores.keys())
+            self.elected.extend(scores.items())
         else:
+            # no one reached quota and a candidate must be eliminated
             min_score = min(scores.values())
             lowest_scoring = [c for c, s in scores.items() if s == min_score]
+
             if len(lowest_scoring) > 1:
-                eliminated = tie_strategy.break_tie(lowest_scoring)
-                if eliminated is None:
-                    raise UnbreakableTieError(elected, lowest_scoring, False)
-            else:
-                eliminated = lowest_scoring[0]
+                raise Exception('tie when eliminating candidates')
 
-            print('Eliminated', eliminated)
-            for ballot in allocation.pop(eliminated):
-                ballot.transfer(allocation)
+            action = RoundAction.ELIMINATED
+            affected = lowest_scoring
+            self.allocation.remove_candidate(lowest_scoring[0])
 
-        round += 1
+        self.rounds.append(Round(number=len(self.rounds),
+                                 scores=scores,
+                                 action=action,
+                                 affected=affected
+                                 ))
 
-    return elected
+    def do_all_rounds(self) -> Result:
+        while len(self.elected) < self.seats:
+            self._do_round()
 
-
-if __name__ == '__main__':
-    from csv import reader
-    import sys
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('seats',
-                        type=int,
-                        default=1,
-                        help='Number of seats in election.')
-    parser.add_argument('file',
-                        nargs='?',
-                        type=argparse.FileType('r'),
-                        default=sys.stdin,
-                        help='CSV file containing ballots. (default: stdin)')
-    parser.add_argument('--no-defaulting',
-                        action='store_true',
-                        help="Don't allow candidates to win by default.")
-    args = parser.parse_args()
-
-    if args.seats < 1:
-        parser.error('must have at least 1 seat')
-
-    csv_reader = reader(args.file)
-    candidates = next(csv_reader)
-    ballots = [Ballot.from_row(row, candidates) for row in csv_reader]
-
-    try:
-        elected = calculate(args.seats,
-                            candidates,
-                            ballots,
-                            no_defaulting=args.no_defaulting,
-                            tie_strategy=TieStrategy.FIRST_IN_ORDER)
-        print('\nElected:', _list_str(elected))
-    except STVError as e:
-        print(f'\n{parser.prog}: error: {e}', file=sys.stderr)
-        print('Elected before error:', _list_str(e.elected), file=sys.stderr)
-        sys.exit(1)
+        return Result(len(self.valid_ballots), self.spoiled_ballot_count, self.quota, self.elected, self.rounds)
