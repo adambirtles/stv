@@ -1,9 +1,33 @@
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Iterable, Iterator, Tuple
 
+import enum
+from copy import deepcopy
 from dataclasses import dataclass
 from fractions import Fraction
-import enum
+from operator import itemgetter
+from itertools import takewhile
+
+
+class InvalidBallotError(Exception):
+    pass
+
+
+class InvalidActionError(Exception):
+    pass
+
+
+class CountingError(Exception):
+    pass
+
+
+class TieError(CountingError):
+    pass
+
+
+class UnfilledSeatsError(CountingError):
+    pass
+
 
 @dataclass
 class Candidate:
@@ -15,22 +39,20 @@ class Candidate:
     def __hash__(self) -> int:
         return hash(self.name)
 
-Electee = Tuple[Candidate, Fraction]
+
+@dataclass
+class Score:
+    candidate: Candidate
+    value: Fraction
+
 
 class CountingBallot:
-    def __init__(self, choices: List[Candidate]):
-        if not choices or len(choices) != len(set(choices)):
-            raise ValueError('empty or spoiled ballot')
+    def __init__(self, preference_list: List[Candidate]):
+        if not preference_list or len(preference_list) != len(set(preference_list)):
+            raise InvalidBallotError('empty or spoiled ballot')
 
-        self.choices = choices
+        self.choices = preference_list
         self.value = Fraction(1)
-
-    @classmethod
-    def valid_ballot(cls, choices: List[Candidate]) -> Optional[CountingBallot]:
-        try:
-            return cls(choices)
-        except ValueError:
-            return None
 
 
 class RoundAction(enum.Enum):
@@ -38,122 +60,154 @@ class RoundAction(enum.Enum):
     ELECTED_BY_DEFAULT = enum.auto()
     ELIMINATED = enum.auto()
 
+    def __str__(self) -> str:
+        return self.name.replace('_', ' ').capitalize()
+
 
 @dataclass
 class Round:
     number: int
-    scores: Dict[Candidate, Fraction]
+    scores: List[Score]
     action: RoundAction
     affected: List[Candidate]
 
 
 @dataclass
-class Result:
-    valid_ballots: int
-    spoiled_ballots: int
+class Summary:
+    seats: int
     quota: int
-    elected: List[Electee]
+    elected: List[Score]
     rounds: List[Round]
 
-
-class Allocation:
-    def __init__(self, candidates: List[Candidate], ballots: List[CountingBallot]):
-        self._alloc: Dict[Candidate, List[CountingBallot]] = {c: [] for c in candidates}
-        for ballot in ballots:
-            self._alloc[ballot.choices[0]].append(ballot)
-
     @property
-    def scores(self) -> Dict[Candidate, Fraction]:
-        return {c: sum((b.value for b in bs), Fraction(0)) for c, bs in self._alloc.items()}
-
-    @property
-    def remaining_candidates(self) -> int:
-        return len(self._alloc)
-
-    def elect_candidate(self, candidate: Candidate, score: Fraction, quota: int) -> None:
-        surplus = score - quota
-
-        if surplus == 0:
-            del self._alloc[candidate]
-            return
-
-        multiplier = Fraction(surplus, quota)
-        for ballot in self._alloc[candidate]:
-            ballot.value *= multiplier
-
-        self.remove_candidate(candidate)
-
-    def remove_candidate(self, candidate: Candidate) -> None:
-        for ballot in self._alloc.pop(candidate):
-            try:
-                while ballot.choices[0] not in self._alloc.keys():
-                    ballot.choices.pop(0)
-
-                self._alloc[ballot.choices[0]].append(ballot)
-            except IndexError:
-                pass
+    def unfilled_seats(self) -> int:
+        return self.seats - len(self.elected)
 
 
 class Election:
-    def __init__(self, seats: int, candidates: List[Candidate], ballots: List[List[Candidate]]):
+    def __init__(
+        self,
+        seats: int,
+        candidates: Iterable[Candidate],
+        preference_lists: Iterable[List[Candidate]] = [],
+    ):
         self.seats = seats
-        self.candidates = candidates
+        self.candidates = set(candidates)
+        self.valid_ballots: List[CountingBallot] = []
+        self.spoiled_ballot_count = 0
 
-        self.valid_ballots = list(filter(None, map(CountingBallot.valid_ballot, ballots)))
-        self.spoiled_ballot_count = len(ballots) - len(self.valid_ballots)
+        for preference_list in preference_lists:
+            self.add_ballot(preference_list)
 
-        self.elected: List[Electee] = []
+    def add_ballot(self, preference_list: List[Candidate]) -> None:
+        try:
+            ballot = CountingBallot(preference_list)
+            self.valid_ballots.append(ballot)
+        except InvalidBallotError:
+            self.spoiled_ballot_count += 1
+
+    def init_count(self) -> Count:
+        return Count(self)
+
+
+class Count:
+    def __init__(self, election: Election):
+        self.seats = election.seats
+
+        self.alloc: Dict[Candidate, List[CountingBallot]] = {c: [] for c in election.candidates}
+        for ballot in election.valid_ballots:
+            self.alloc[ballot.choices[0]].append(ballot)
+
         self.rounds: List[Round] = []
-        self.allocation = Allocation(candidates, self.valid_ballots)
+        self.elected: List[Score] = []
+        self.quota = (len(election.valid_ballots) // (self.seats + 1)) + 1
 
-        self.allow_defaulting = False
+    def _elect(self, score: Score) -> None:
+        surplus = score.value - self.quota
 
-        self.quota = (len(self.valid_ballots) // (seats + 1)) + 1
+        if surplus == 0:
+            # ballot values would end up being 0 so just drop them
+            del self.alloc[score.candidate]
+        else:
+            multiplier = Fraction(surplus, self.quota)
+            for ballot in self.alloc[score.candidate]:
+                ballot.value *= multiplier
+            self._redistribute_ballots(score.candidate)
 
-    def _do_round(self) -> None:
+        self.elected.append(score)
+
+    def _redistribute_ballots(self, candidate: Candidate) -> None:
+        for ballot in self.alloc.pop(candidate):
+            try:
+                while ballot.choices[0] not in self.alloc.keys():
+                    ballot.choices.pop(0)
+
+                self.alloc[ballot.choices[0]].append(ballot)
+            except IndexError:
+                # Ballot has now been exhausted, drop it
+                pass
+
+    def _do_round(self) -> Round:
+        action: RoundAction
+        affected: List[Candidate] = []
+
         open_seats = self.seats - len(self.elected)
 
-        scores = self.allocation.scores
-        reached_quota = {c: s for c, s in scores.items() if s >= self.quota}
-        if reached_quota:
+        # Add up scores and sort them in descending order
+        scores = [Score(c, sum((b.value for b in bs), Fraction(0))) for c, bs in self.alloc.items()]
+        scores.sort(reverse=True, key=lambda s: s.value)
+
+        if scores[0].value >= self.quota:
             # at least one candidate reached quota
+            reached_quota = list(takewhile(lambda s: s.value >= self.quota, scores))
             if len(reached_quota) > open_seats:
-                raise Exception('tie between candidates to be elected')
+                # more candidates reached quota than there are available
+                # seats, take candidates with highest scores unless
+                # there is a tie
+                if reached_quota[open_seats].value == reached_quota[open_seats - 1].value:
+                    raise TieError('tie between candidates to be elected')
+
+                reached_quota = reached_quota[:open_seats]
 
             action = RoundAction.ELECTED
-            affected = list(reached_quota.keys())
 
-            self.elected.extend(reached_quota.items())
-            for candidate, score in reached_quota.items():
-                self.allocation.elect_candidate(candidate, score, self.quota)
-        elif self.allocation.remaining_candidates <= open_seats:
+            for score in reached_quota:
+                affected.append(score.candidate)
+                self._elect(score)
+        elif len(self.alloc) <= open_seats:
             # no one reached quota but candidates can win by default
-            if not self.allow_defaulting:
-                raise Exception('not enough candidates could reach quota to fill all seats')
-
             action = RoundAction.ELECTED_BY_DEFAULT
-            affected = list(scores.keys())
-            self.elected.extend(scores.items())
+            for score in scores:
+                affected.append(score.candidate)
+                self._elect(score)
         else:
-            # no one reached quota and a candidate must be eliminated
-            min_score = min(scores.values())
-            lowest_scoring = [c for c, s in scores.items() if s == min_score]
-
-            if len(lowest_scoring) > 1:
-                raise Exception('tie when eliminating candidates')
+            # no one reached quota, eliminate candidates with the lowest score
+            lowest_scores = takewhile(lambda s: s.value == scores[-1].value, reversed(scores))
 
             action = RoundAction.ELIMINATED
-            affected = lowest_scoring
-            self.allocation.remove_candidate(lowest_scoring[0])
+            for score in lowest_scores:
+                affected.append(score.candidate)
+                self._redistribute_ballots(score.candidate)
 
-        self.rounds.append(Round(number=len(self.rounds),
-                                 scores=scores,
-                                 action=action,
-                                 affected=affected
-                                 ))
+        round = Round(
+            number=len(self.rounds) + 1,
+            scores=scores,
+            action=action,
+            affected=affected,
+        )
+        self.rounds.append(round)
+        return round
 
-    def do_all_rounds(self) -> Result:
-        while len(self.elected) < self.seats:
+    @property
+    def is_counting(self) -> bool:
+        return len(self.elected) < self.seats and len(self.alloc) > 0
+
+    def round_iter(self) -> Iterator[Round]:
+        while self.is_counting:
+            yield self._do_round()
+
+    def get_summary(self) -> Summary:
+        while self.is_counting:
             self._do_round()
 
-        return Result(len(self.valid_ballots), self.spoiled_ballot_count, self.quota, self.elected, self.rounds)
+        return Summary(seats=self.seats, quota=self.quota, elected=self.elected, rounds=self.rounds)
