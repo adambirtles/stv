@@ -9,20 +9,26 @@ from typing import Optional
 
 import stv
 
-parser = argparse.ArgumentParser(description='Count votes')
+parser = argparse.ArgumentParser(
+    description='Count votes',
+    epilog='''The first row of the CSV file should be a list of
+    candidates and each subsequent row should be each ballot as a list
+    of preferences.
+    ''',
+)
 
 parser.add_argument(
     'seats',
     type=int,
-    help='number of seats being elected (default: 1)',
-    metavar='N',
+    help='Number of seats being elected',
 )
 
 parser.add_argument(
     'file',
     type=argparse.FileType('r'),
-    help='CSV file containing ballots as output by Google Forms',
+    help='CSV file as described below.',
     default=stdin,
+    nargs='?',
 )
 
 args = parser.parse_args()
